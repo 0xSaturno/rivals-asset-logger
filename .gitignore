@@ -1,0 +1,26 @@
+# Visual Studio metadata
+.vs/
+*.user
+*.suo
+*.sln.docstates
+
+# Build output directories
+x64/
+x86/
+Debug/
+Release/
+Build/
+
+# Intermediate files
+*.obj
+*.pdb
+*.tlog
+*.idb
+*.ilk
+*.exp
+
+# Compiled binaries
+*.dll
+*.asi
+*.lib
+*.exe
