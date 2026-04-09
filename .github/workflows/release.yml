@@ -1,0 +1,97 @@
+name: AssetLogger CI/CD Release
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build (Release x64)
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository (with submodules)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Build AssetLogger
+        shell: pwsh
+        run: |
+          msbuild AssetLogger.sln /p:Configuration=Release /p:Platform=x64 /m /v:minimal
+
+      - name: Debug build output
+        shell: pwsh
+        run: |
+          Write-Host "[debug] Listing Build/OutputDLL contents..."
+          if (Test-Path "Build/OutputDLL") {
+            Get-ChildItem -Recurse "Build/OutputDLL" | Format-Table -AutoSize
+          } else {
+            Write-Error "Build/OutputDLL not found"
+            exit 1
+          }
+
+      - name: Verify output binary exists
+        shell: pwsh
+        run: |
+          $artifact = "Build/OutputDLL/AssetLogger.asi"
+          if (!(Test-Path $artifact)) {
+            Write-Error "Expected output not found: $artifact"
+            exit 1
+          }
+          Write-Host "[ok] Found $artifact"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AssetLogger-Release-x64
+          path: |
+            Build/OutputDLL/AssetLogger.asi
+            Build/OutputDLL/AssetLogger.pdb
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    runs-on: windows-latest
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: AssetLogger-Release-x64
+          path: dist
+
+      - name: Debug downloaded artifact
+        shell: pwsh
+        run: |
+          Write-Host "[debug] Listing dist contents..."
+          Get-ChildItem -Recurse dist | Format-Table -AutoSize
+
+      - name: Create release zip
+        shell: pwsh
+        run: |
+          $zipPath = "AssetLogger-${{ github.ref_name }}-win64.zip"
+          Compress-Archive -Path "dist/*" -DestinationPath $zipPath -Force
+          Write-Host "[ok] Created $zipPath"
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            AssetLogger-${{ github.ref_name }}-win64.zip
