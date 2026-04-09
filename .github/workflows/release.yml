@@ -86,7 +86,7 @@ jobs:
         shell: pwsh
         run: |
           $zipPath = "AssetLogger-${{ github.ref_name }}-win64.zip"
-          Compress-Archive -Path "dist/*" -DestinationPath $zipPath -Force
+          Compress-Archive -Path "dist/AssetLogger.asi" -DestinationPath $zipPath -Force
           Write-Host "[ok] Created $zipPath"
 
       - name: Publish GitHub release
