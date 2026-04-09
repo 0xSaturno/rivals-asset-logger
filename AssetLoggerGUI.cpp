@@ -327,10 +327,12 @@ static void RenderFrame() {
         ImGui::SetCursorPosX(ImGui::GetWindowWidth() - 330);
         if (!AssetScanner::gCalibrated) {
             ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.2f, 1.0f), "Waiting for game...");
-        } else {
+        }
+        else {
             ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.6f, 1.0f),
                 "GObjects: %d | Baseline: %d",
-                AssetScanner::gTotalGObjects, AssetScanner::gBaselineCount);
+                AssetScanner::gTotalGObjects.load(std::memory_order_relaxed),
+                AssetScanner::gBaselineCount);
         }
     }
 

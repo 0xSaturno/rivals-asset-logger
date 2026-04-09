@@ -8,15 +8,16 @@
 // ============================================================================
 
 // Shared state definitions
+static std::mutex gKnownMutex; // guards gKnownObjs independently
 std::mutex                           AssetScanner::gMutex;
 std::vector<TrackedAsset>            AssetScanner::gAssets;
 std::unordered_set<uintptr_t>        AssetScanner::gKnownObjs;
 std::unordered_map<int, int>         AssetScanner::gCategoryStats;
-volatile bool                        AssetScanner::gScanEnabled = true;
-volatile bool                        AssetScanner::gRunning = true;
-volatile int                         AssetScanner::gScanInterval = 100;
-volatile bool                        AssetScanner::gForceScan = false;
-int                                  AssetScanner::gTotalGObjects = 0;
+std::atomic<bool>                    AssetScanner::gScanEnabled{ true };
+std::atomic<bool>                    AssetScanner::gRunning{ true };
+std::atomic<bool>                    AssetScanner::gForceScan{ false };
+std::atomic<int>                     AssetScanner::gScanInterval{ 100 };
+std::atomic<int>                     AssetScanner::gTotalGObjects{ 0 };
 int                                  AssetScanner::gBaselineCount = 0;
 uint64_t                             AssetScanner::gStartTime = 0;
 bool                                 AssetScanner::gCalibrated = false;
@@ -190,33 +191,41 @@ static uintptr_t GetUObjectByIndex(int index) {
 
 static void ScanForNewAssets() {
     int num = GetNumUObjects();
-    if (num <= 0 || num > 10000000) return;
-    AssetScanner::gTotalGObjects = num;
+    if (num <= 0 || num > 10'000'000) return;
+    AssetScanner::gTotalGObjects.store(num, std::memory_order_relaxed);
+
     uint64_t now = GetTickCount64() - AssetScanner::gStartTime;
     int added = 0;
 
-    std::vector<TrackedAsset> localAdditions;
-    std::unordered_map<int, int> localStats;
+    std::vector<TrackedAsset>        localAdditions;
+    std::unordered_map<int, int>     localStats;
+    std::vector<uintptr_t>           toInsert; // new addresses to register
 
     for (int i = 0; i < num; i++) {
         uintptr_t obj = GetUObjectByIndex(i);
         if (!obj) continue;
-        if (AssetScanner::gKnownObjs.count(obj)) continue;
-        AssetScanner::gKnownObjs.insert(obj);
 
+        // ── Check + mark known — under its own lock ──────────────────────────
+        {
+            std::lock_guard<std::mutex> kl(gKnownMutex);
+            if (AssetScanner::gKnownObjs.count(obj)) continue;
+            AssetScanner::gKnownObjs.insert(obj);
+        }
+
+        // ── All memory reads happen outside any lock ──────────────────────────
         std::string cls = ClassName(obj);
         if (cls.empty() || IsReflectionNoise(cls)) continue;
         std::string objName = ObjectFName(obj);
         if (objName.empty()) continue;
-
         std::string fullPath = GetObjectPath(obj);
+
         AssetCategory cat = ClassifyAsset(cls, objName, fullPath);
 
         TrackedAsset asset;
         asset.address = obj;
-        asset.className = cls;
-        asset.objectName = objName;
-        asset.fullPath = fullPath;
+        asset.className = std::move(cls);
+        asset.objectName = std::move(objName);
+        asset.fullPath = std::move(fullPath);
         asset.category = cat;
         asset.discoveryTimeMs = now;
         asset.bookmarked = false;
@@ -224,16 +233,15 @@ static void ScanForNewAssets() {
         localAdditions.push_back(std::move(asset));
         localStats[(int)cat]++;
 
-        // Cap at 5000 per pass to prevent complete thread stall on massive map load spikes
-        if (++added > 5000) break;
+        if (++added >= 5000) break;
     }
 
     if (!localAdditions.empty()) {
         std::lock_guard<std::mutex> lk(AssetScanner::gMutex);
-        for (auto& st : localStats) {
-            AssetScanner::gCategoryStats[st.first] += st.second;
-        }
-        AssetScanner::gAssets.insert(AssetScanner::gAssets.end(),
+        for (auto& [k, v] : localStats)
+            AssetScanner::gCategoryStats[k] += v;
+        AssetScanner::gAssets.insert(
+            AssetScanner::gAssets.end(),
             std::make_move_iterator(localAdditions.begin()),
             std::make_move_iterator(localAdditions.end()));
     }
@@ -246,7 +254,7 @@ static DWORD WINAPI ScanThread(LPVOID) {
 
     // Wait for GWorld
     uintptr_t gworldAddr = gBase + OFFSET_GWORLD;
-    for (int i = 0; i < 120 && AssetScanner::gRunning; i++) {
+    for (int i = 0; i < 120 && AssetScanner::gRunning.load(); i++) {
         if (RPtr(gworldAddr)) break;
         Sleep(500);
     }
@@ -257,21 +265,26 @@ static DWORD WINAPI ScanThread(LPVOID) {
     if (!CalibrateStride(world)) return 1;
     AssetScanner::gCalibrated = true;
 
-    // Baseline scan
-    int num = GetNumUObjects();
-    for (int i = 0; i < num; i++) {
-        uintptr_t obj = GetUObjectByIndex(i);
-        if (obj) AssetScanner::gKnownObjs.insert(obj);
+    {
+        std::lock_guard<std::mutex> kl(gKnownMutex);
+        int num = GetNumUObjects();
+        for (int i = 0; i < num; i++) {
+            uintptr_t obj = GetUObjectByIndex(i);
+            if (obj) AssetScanner::gKnownObjs.insert(obj);
+        }
+        AssetScanner::gBaselineCount = (int)AssetScanner::gKnownObjs.size();
     }
-    AssetScanner::gBaselineCount = (int)AssetScanner::gKnownObjs.size();
+
 
     // Main loop
-    while (AssetScanner::gRunning) {
-        if (AssetScanner::gScanEnabled || AssetScanner::gForceScan) {
+    while (AssetScanner::gRunning.load()) {
+        if (AssetScanner::gScanEnabled.load() || AssetScanner::gForceScan.load()) {
             ScanForNewAssets();
-            AssetScanner::gForceScan = false;
+            AssetScanner::gForceScan.store(false);
         }
-        for (int s = 0; s < AssetScanner::gScanInterval && AssetScanner::gRunning && !AssetScanner::gForceScan; s += 20) {
+        int interval = AssetScanner::gScanInterval.load();
+        for (int s = 0; s < interval && AssetScanner::gRunning.load()
+            && !AssetScanner::gForceScan.load(); s += 20) {
             Sleep(20);
         }
     }
@@ -280,9 +293,12 @@ static DWORD WINAPI ScanThread(LPVOID) {
 
 void AssetScanner::ResetBaseline() {
     std::lock_guard<std::mutex> lk(gMutex);
+    std::lock_guard<std::mutex> kl(gKnownMutex);
+
     gKnownObjs.clear();
     gAssets.clear();
     gCategoryStats.clear();
+
     int num = GetNumUObjects();
     for (int i = 0; i < num; i++) {
         uintptr_t obj = GetUObjectByIndex(i);
@@ -304,28 +320,32 @@ std::vector<TrackedAsset> AssetScanner::GetHeuristicDependencies(uintptr_t objAd
     std::vector<TrackedAsset> deps;
     if (!objAddr) return deps;
 
+    // Snapshot the asset list while locked 
+    std::vector<TrackedAsset> snapshot;
+    {
+        std::lock_guard<std::mutex> lk(gMutex);
+        snapshot = gAssets; // copy
+    }
+
     // Scan up to ~2KB of the object's instance memory
     // (most properties fit here; we avoid overscanning to prevent huge pauses)
     const int SCAN_BYTES = 2048;
-    
     std::unordered_set<uintptr_t> foundPointers;
     for (int offset = 0x28; offset < SCAN_BYTES; offset += 8) {
-        uintptr_t val = RPtr(objAddr + offset);
-        if (val && val != objAddr && foundPointers.find(val) == foundPointers.end()) {
+        uintptr_t val = RPtr(objAddr + offset); 
+        if (val && val != objAddr)
             foundPointers.insert(val);
-        }
     }
+
 
     if (foundPointers.empty()) return deps;
 
-    // Match found pointers against tracked assets safely
-    std::lock_guard<std::mutex> lk(gMutex);
-    for (auto& asset : gAssets) {
-        if (foundPointers.find(asset.address) != foundPointers.end()) {
-            // Ignore common noise unless it's specifically useful
-            if (asset.category != AssetCategory::Other || asset.className.find("Property") == std::string::npos) {
-                deps.push_back(asset); // copy
-            }
+    // Match found pointers against snapshot instead
+    for (auto& asset : snapshot) {
+        if (foundPointers.count(asset.address)) {
+            if (asset.category != AssetCategory::Other ||
+                asset.className.find("Property") == std::string::npos)
+                deps.push_back(asset);
         }
     }
 
