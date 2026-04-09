@@ -61,11 +61,11 @@ namespace AssetScanner {
     extern std::vector<TrackedAsset>            gAssets;
     extern std::unordered_set<uintptr_t>        gKnownObjs;
     extern std::unordered_map<int, int>         gCategoryStats;
-    extern volatile bool                        gScanEnabled;
-    extern volatile bool                        gRunning;
-    extern volatile int                         gScanInterval;
-    extern volatile bool                        gForceScan;
-    extern int                                  gTotalGObjects;
+    extern std::atomic<bool>                    gScanEnabled;
+    extern std::atomic<bool>                    gRunning;
+    extern std::atomic<bool>                    gForceScan;
+    extern std::atomic<int>                     gScanInterval;
+    extern std::atomic<int>                     gTotalGObjects;
     extern int                                  gBaselineCount;
     extern uint64_t                             gStartTime;
     extern bool                                 gCalibrated;
