@@ -220,7 +220,7 @@ static bool TryCalibrateFNameConfig(const FNameValue& name) {
 
 static bool CalibrateFNameResolver(uintptr_t knownObj) {
     gFNamePool = gBase + (gOffsetFNamePool ? gOffsetFNamePool : ue_offsets_gnames());
-    gFNameAppend = gBase + ;
+    gFNameAppend = gBase + ue_offsets_fname_append();
 
     if (CanRead(gFNamePool + 0x10, 8)) {
         if (CanRead(knownObj + OFF_UObject_FName, sizeof(FNameValue))) {
