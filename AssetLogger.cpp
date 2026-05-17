@@ -1,9 +1,9 @@
 #include "AssetLogger.h"
-#include "../sdk_offsets.h"
-#include <cstdio>
+#include "rivals_offsets.h"
+#include "sdk_offsets.h"
 
 // ============================================================================
-// AssetScanner — GObjects walker running on its own thread.
+// AssetScanner - GObjects walker running on its own thread.
 // Populates the shared gAssets vector for the GUI to display.
 // ============================================================================
 
@@ -23,7 +23,17 @@ uint64_t                             AssetScanner::gStartTime = 0;
 bool                                 AssetScanner::gCalibrated = false;
 
 static uintptr_t gBase = 0;
-static int gStride = 0, gLenShift = 1, gLenOffset = 0, gHdrSize = 2;
+static uintptr_t gOffsetGWorld = 0;
+static uintptr_t gOffsetFNamePool = 0;
+static uintptr_t gOffsetGObjects = 0;
+static uintptr_t gFNameAppend = 0;
+static uintptr_t gFNamePool = 0;
+static int gNameMul = 0;
+static int gLenShift = 0;
+static int gLenOffset = 0;
+static int gStrOffset = 0;
+
+static uintptr_t RPtr(uintptr_t a);
 
 // --- Safe memory ---
 static bool CanRead(uintptr_t addr, size_t sz = 8) {
@@ -32,39 +42,138 @@ static bool CanRead(uintptr_t addr, size_t sz = 8) {
     if (!VirtualQuery((void*)addr, &mbi, sizeof(mbi))) return false;
     if (mbi.State != MEM_COMMIT) return false;
     if (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) return false;
+    uintptr_t regionEnd = (uintptr_t)mbi.BaseAddress + mbi.RegionSize;
+    if (addr + sz < addr || addr + sz > regionEnd) return false;
     return true;
 }
 static uintptr_t RPtr(uintptr_t a) { return CanRead(a) ? *(uintptr_t*)a : 0; }
 static int32_t   RI32(uintptr_t a) { return CanRead(a, 4) ? *(int32_t*)a : 0; }
 
 // --- FName resolution ---
-static std::string ResolveFName(int32_t idx) {
-    if (idx <= 0 || gStride == 0) return {};
-    int block = idx >> 16, off = idx & 0xFFFF;
-    if (block < 0 || block >= 8192) return {};
-    uintptr_t pool = gBase + OFFSET_GNAMES;
-    uintptr_t blk = RPtr(pool + 0x10 + block * 8);
-    if (!blk) return {};
-    uintptr_t entry = blk + (uintptr_t)off * gStride;
-    if (!CanRead(entry, gHdrSize)) return {};
-    uint16_t hdr = *(uint16_t*)(entry + gLenOffset);
-    bool wide = hdr & 1;
-    int len = hdr >> gLenShift;
-    if (len <= 0 || len > 1024 || wide) return {};
-    const char* s = (const char*)(entry + gHdrSize);
-    if (!CanRead((uintptr_t)s, len)) return {};
-    return std::string(s, len);
+struct FNameValue {
+    int32_t ComparisonIndex = 0;
+    int32_t Number = 0;
+};
+
+struct FStringValue {
+    wchar_t* Data = nullptr;
+    int32_t Count = 0;
+    int32_t Max = 0;
+};
+
+using FNameAppendStringFn = void(__fastcall*)(const FNameValue*, FStringValue*);
+
+struct FNameCfg { int mul, lenOff, strOff, lenShift; };
+
+static FNameCfg gFNameConfigs[] = {
+    {2, 0, 2, 6},
+    {1, 0, 2, 6},
+    {2, 0, 2, 1},
+    {4, 4, 6, 1},
+    {4, 4, 6, 6},
+    {2, 4, 6, 1},
+    {4, 0, 2, 1},
+    {1, 0, 2, 1},
+};
+
+static std::string NarrowFromWide(const wchar_t* s, int len) {
+    if (!s || len <= 0) return {};
+
+    int needed = WideCharToMultiByte(CP_UTF8, 0, s, len, nullptr, 0, nullptr, nullptr);
+    if (needed <= 0) return {};
+
+    std::string out;
+    out.resize((size_t)needed);
+    WideCharToMultiByte(CP_UTF8, 0, s, len, out.data(), needed, nullptr, nullptr);
+    return out;
+}
+
+static uintptr_t GetFNameBlock(uintptr_t pool, int block) {
+    if (!pool || block < 0 || block >= 8192) return 0;
+    return RPtr(pool + 0x10 + block * 8);
+}
+
+static bool TryDecodeFNamePool(const FNameValue& name, const FNameCfg& cfg, std::string* out = nullptr) {
+    if (name.ComparisonIndex <= 0 || !gFNamePool) return false;
+
+    int block = name.ComparisonIndex >> 16;
+    int off = name.ComparisonIndex & 0xFFFF;
+    uintptr_t blk = GetFNameBlock(gFNamePool, block);
+    if (!blk) return false;
+
+    uintptr_t entry = blk + (uintptr_t)off * cfg.mul;
+    if (!CanRead(entry, cfg.strOff + 256)) return false;
+
+    uint16_t hdr = *(uint16_t*)(entry + cfg.lenOff);
+    if (hdr & 1) return false;
+
+    int len = hdr >> cfg.lenShift;
+    if (len <= 0 || len > 200) return false;
+
+    const char* s = (const char*)(entry + cfg.strOff);
+    if (!CanRead((uintptr_t)s, (size_t)len)) return false;
+
+    for (int i = 0; i < len; i++) {
+        char ch = s[i];
+        if (!((ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') || ch == '_')) {
+            return false;
+        }
+    }
+
+    if (out) {
+        *out = std::string(s, len);
+        if (name.Number > 0) {
+            *out += "_";
+            *out += std::to_string(name.Number - 1);
+        }
+    }
+    return len >= 3;
+}
+
+static std::string ResolveFNamePool(const FNameValue& name) {
+    if (!gFNamePool || !gNameMul) return {};
+
+    FNameCfg cfg{ gNameMul, gLenOffset, gStrOffset, gLenShift };
+    std::string out;
+    return TryDecodeFNamePool(name, cfg, &out) ? out : std::string{};
+}
+
+static std::string ResolveFName(const FNameValue& name) {
+    if (name.ComparisonIndex <= 0) return {};
+
+    std::string poolName = ResolveFNamePool(name);
+    if (!poolName.empty()) return poolName;
+
+    if (!gFNameAppend) return {};
+
+    wchar_t buffer[512]{};
+    FStringValue out{};
+    out.Data = buffer;
+    out.Count = 0;
+    out.Max = (int32_t)(sizeof(buffer) / sizeof(buffer[0]));
+
+    auto appendString = (FNameAppendStringFn)gFNameAppend;
+    appendString(&name, &out);
+
+    if (!out.Data || out.Count <= 0) return {};
+    int len = out.Count;
+    if (out.Data[len - 1] == L'\0') len--;
+    if (len <= 0 || len >= out.Max) return {};
+
+    return NarrowFromWide(out.Data, len);
 }
 
 static std::string ObjectFName(uintptr_t obj) {
     if (!obj) return {};
-    return ResolveFName(RI32(obj + OFF_UObject_FName));
+    if (!CanRead(obj + OFF_UObject_FName, sizeof(FNameValue))) return {};
+    return ResolveFName(*(FNameValue*)(obj + OFF_UObject_FName));
 }
 
 static std::string ClassName(uintptr_t obj) {
     if (!obj) return {};
     uintptr_t cls = RPtr(obj + OFF_UObject_Class);
-    return cls ? ResolveFName(RI32(cls + OFF_UObject_FName)) : std::string{};
+    if (!cls || !CanRead(cls + OFF_UObject_FName, sizeof(FNameValue))) return {};
+    return ResolveFName(*(FNameValue*)(cls + OFF_UObject_FName));
 }
 
 static std::string GetObjectPath(uintptr_t obj) {
@@ -85,7 +194,7 @@ static std::string GetObjectPath(uintptr_t obj) {
         if (!path.empty()) path += "/";
         path += parts[i];
     }
-    
+
     // Clean up common UE prefixes
     if (path.compare(0, 6, "/Game/") == 0) {
         path = path.substr(6);
@@ -96,35 +205,36 @@ static std::string GetObjectPath(uintptr_t obj) {
 }
 
 // --- FName calibration ---
-static bool CalibrateStride(uintptr_t knownObj) {
-    int32_t clsFNameId = RI32(RPtr(knownObj + OFF_UObject_Class) + OFF_UObject_FName);
-    int block = clsFNameId >> 16, offset = clsFNameId & 0xFFFF;
-    uintptr_t pool = gBase + OFFSET_GNAMES;
-    uintptr_t blk = RPtr(pool + 0x10 + block * 8);
-    if (!blk) return false;
-    struct Cfg { int stride, lenOff, strOff, lenShift; };
-    Cfg configs[] = {
-        {4,4,6,1},{2,0,2,1},{2,0,2,6},{4,4,6,6},{2,4,6,1},{4,0,2,1},{1,0,2,1},
-    };
-    for (auto& c : configs) {
-        uintptr_t entry = blk + (uintptr_t)offset * c.stride;
-        if (!CanRead(entry, c.strOff + 40)) continue;
-        uint16_t hdr = *(uint16_t*)(entry + c.lenOff);
-        int len = hdr >> c.lenShift;
-        if ((hdr & 1) || len <= 0 || len > 200) continue;
-        const char* str = (const char*)(entry + c.strOff);
-        if (!CanRead((uintptr_t)str, len)) continue;
-        bool ok = true;
-        for (int i = 0; i < len; i++) {
-            char ch = str[i];
-            if (!((ch>='A'&&ch<='Z')||(ch>='a'&&ch<='z')||(ch>='0'&&ch<='9')||ch=='_')) { ok=false; break; }
-        }
-        if (ok && len >= 3) {
-            gStride = c.stride; gLenShift = c.lenShift; gLenOffset = c.lenOff; gHdrSize = c.strOff;
+static bool TryCalibrateFNameConfig(const FNameValue& name) {
+    for (const auto& cfg : gFNameConfigs) {
+        if (TryDecodeFNamePool(name, cfg)) {
+            gNameMul = cfg.mul;
+            gLenOffset = cfg.lenOff;
+            gStrOffset = cfg.strOff;
+            gLenShift = cfg.lenShift;
             return true;
         }
     }
     return false;
+}
+
+static bool CalibrateFNameResolver(uintptr_t knownObj) {
+    gFNamePool = gBase + (gOffsetFNamePool ? gOffsetFNamePool : ue_offsets_gnames());
+    gFNameAppend = gBase + ue_offsets_fname_append();
+
+    if (CanRead(gFNamePool + 0x10, 8)) {
+        if (CanRead(knownObj + OFF_UObject_FName, sizeof(FNameValue))) {
+            if (TryCalibrateFNameConfig(*(FNameValue*)(knownObj + OFF_UObject_FName))) return true;
+        }
+
+        uintptr_t cls = RPtr(knownObj + OFF_UObject_Class);
+        if (cls && CanRead(cls + OFF_UObject_FName, sizeof(FNameValue))) {
+            if (TryCalibrateFNameConfig(*(FNameValue*)(cls + OFF_UObject_FName))) return true;
+        }
+    }
+
+    if (!CanRead(gFNameAppend, 16)) return false;
+    return !ObjectFName(knownObj).empty() || !ClassName(knownObj).empty();
 }
 
 // --- Asset classification ---
@@ -175,12 +285,13 @@ static constexpr int OBJ_PER_CHUNK = 65536;
 static constexpr int FUOBJ_SIZE = 0x18;
 
 static int GetNumUObjects() {
-    uintptr_t go = gBase + OFFSET_GOBJECTS;
-    return CanRead(go + 0x14, 4) ? RI32(go + 0x14) : 0;
+    uintptr_t go = gBase + gOffsetGObjects;
+    return (go && CanRead(go + 0x14, 4)) ? RI32(go + 0x14) : 0;
 }
 
 static uintptr_t GetUObjectByIndex(int index) {
-    uintptr_t go = gBase + OFFSET_GOBJECTS;
+    uintptr_t go = gBase + gOffsetGObjects;
+    if (!go) return 0;
     uintptr_t ca = RPtr(go);
     if (!ca) return 0;
     int ci = index / OBJ_PER_CHUNK, wi = index % OBJ_PER_CHUNK;
@@ -199,20 +310,18 @@ static void ScanForNewAssets() {
 
     std::vector<TrackedAsset>        localAdditions;
     std::unordered_map<int, int>     localStats;
-    std::vector<uintptr_t>           toInsert; // new addresses to register
-
     for (int i = 0; i < num; i++) {
         uintptr_t obj = GetUObjectByIndex(i);
         if (!obj) continue;
 
-        // ── Check + mark known — under its own lock ──────────────────────────
+        // Check and mark known under its own lock.
         {
             std::lock_guard<std::mutex> kl(gKnownMutex);
             if (AssetScanner::gKnownObjs.count(obj)) continue;
             AssetScanner::gKnownObjs.insert(obj);
         }
 
-        // ── All memory reads happen outside any lock ──────────────────────────
+        // All memory reads happen outside any lock.
         std::string cls = ClassName(obj);
         if (cls.empty() || IsReflectionNoise(cls)) continue;
         std::string objName = ObjectFName(obj);
@@ -252,17 +361,46 @@ static DWORD WINAPI ScanThread(LPVOID) {
     gBase = (uintptr_t)GetModuleHandle(nullptr);
     AssetScanner::gStartTime = GetTickCount64();
 
-    // Wait for GWorld
-    uintptr_t gworldAddr = gBase + OFFSET_GWORLD;
-    for (int i = 0; i < 120 && AssetScanner::gRunning.load(); i++) {
+    ue_offsets_start();
+
+    for (int i = 0; i < 240 && AssetScanner::gRunning.load(); i++) {
+        gOffsetGWorld = (uintptr_t)ue_offsets_gworld_storage();
+        gOffsetFNamePool = (uintptr_t)ue_offsets_gnames();
+        gOffsetGObjects = (uintptr_t)ue_offsets_gobjects_storage();
+
+        if (gOffsetGWorld && gOffsetGObjects) break;
+        Sleep(500);
+    }
+
+    if (!gOffsetGWorld || !gOffsetGObjects) return 1;
+
+    // Match the old header path: GWorld global address stores the live world pointer.
+    uintptr_t gworldAddr = gBase + gOffsetGWorld;
+    for (int i = 0; i < 240 && AssetScanner::gRunning.load(); i++) {
         if (RPtr(gworldAddr)) break;
         Sleep(500);
     }
+
     if (!RPtr(gworldAddr)) return 1;
-    Sleep(3000);
+
+    Sleep(1000); // small settle delay
 
     uintptr_t world = RPtr(gworldAddr);
-    if (!CalibrateStride(world)) return 1;
+
+    bool calibrated = CalibrateFNameResolver(world);
+    if (!calibrated) {
+        int num = GetNumUObjects();
+        int limit = num < 4096 ? num : 4096;
+        for (int i = 0; i < limit; i++) {
+            uintptr_t obj = GetUObjectByIndex(i);
+            if (obj && CanRead(obj + OFF_UObject_Class, 8) && CalibrateFNameResolver(obj)) {
+                calibrated = true;
+                break;
+            }
+        }
+    }
+
+    if (!calibrated) return 1;
     AssetScanner::gCalibrated = true;
 
     {
@@ -274,7 +412,6 @@ static DWORD WINAPI ScanThread(LPVOID) {
         }
         AssetScanner::gBaselineCount = (int)AssetScanner::gKnownObjs.size();
     }
-
 
     // Main loop
     while (AssetScanner::gRunning.load()) {
@@ -290,6 +427,7 @@ static DWORD WINAPI ScanThread(LPVOID) {
     }
     return 0;
 }
+
 
 void AssetScanner::ResetBaseline() {
     std::lock_guard<std::mutex> lk(gMutex);
@@ -320,7 +458,7 @@ std::vector<TrackedAsset> AssetScanner::GetHeuristicDependencies(uintptr_t objAd
     std::vector<TrackedAsset> deps;
     if (!objAddr) return deps;
 
-    // Snapshot the asset list while locked 
+    // Snapshot the asset list while locked
     std::vector<TrackedAsset> snapshot;
     {
         std::lock_guard<std::mutex> lk(gMutex);
@@ -332,7 +470,7 @@ std::vector<TrackedAsset> AssetScanner::GetHeuristicDependencies(uintptr_t objAd
     const int SCAN_BYTES = 2048;
     std::unordered_set<uintptr_t> foundPointers;
     for (int offset = 0x28; offset < SCAN_BYTES; offset += 8) {
-        uintptr_t val = RPtr(objAddr + offset); 
+        uintptr_t val = RPtr(objAddr + offset);
         if (val && val != objAddr)
             foundPointers.insert(val);
     }

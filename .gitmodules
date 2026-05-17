@@ -1,3 +1,6 @@
 [submodule "imgui"]
 	path = imgui
 	url = https://github.com/ocornut/imgui
+[submodule "rivals_offset_finder"]
+	path = rivals_offset_finder
+	url = https://github.com/natimerry/rivals_offset_finder.git
